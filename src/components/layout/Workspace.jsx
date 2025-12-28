@@ -17,6 +17,9 @@ export default function Workspace({
   // Backend bytes plumbing (NEW)
   onPdfBytesChange,
 
+  // Selection callback
+  onSelectedObjectChange,
+
   showDebugOverlay,
 }) {
   const scrollContainerRef = useRef(null);
@@ -116,6 +119,7 @@ export default function Workspace({
             onPageChange={onPageChange}
             currentPage={currentPage}
             showDebugOverlay={showDebugOverlay}
+            onSelectedObjectChange={onSelectedObjectChange}
           />
         </div>
       ) : (

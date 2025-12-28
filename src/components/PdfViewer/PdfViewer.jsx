@@ -51,11 +51,17 @@ const PdfViewer = forwardRef(function PdfViewer(
     currentTool = "REMOVE_TEXT",
     currentPage = 1,
     showDebugOverlay = false,
+    onSelectedObjectChange, // ✅ NEW: Callback to notify App about selection changes
   },
   ref
 ) {
   const [pdfDoc, setPdfDoc] = useState(null);
   const [pageCount, setPageCount] = useState(0);
+
+  // Undo history for deletions - stores PDF bytes before each deletion
+  // Limited to 20 actions to prevent excessive memory usage
+  const [undoHistory, setUndoHistory] = useState([]);
+  const MAX_UNDO_HISTORY = 20;
 
   // Stored in PDF units (scale=1), per page: 
   // { [pageNum]: [{x,y,width,height}, ...] }
@@ -81,6 +87,11 @@ const PdfViewer = forwardRef(function PdfViewer(
 
   const dpr = useMemo(() => window.devicePixelRatio || 1, []);
 
+  // Notify parent when selected object changes
+  useEffect(() => {
+    onSelectedObjectChange?.(selectedObject);
+  }, [selectedObject, onSelectedObjectChange]);
+
   // ---------------------------------------------------------
   // 1) LOAD PDF
   // ---------------------------------------------------------
@@ -93,6 +104,8 @@ const PdfViewer = forwardRef(function PdfViewer(
           setPdfDoc(null);
           setPageCount(0);
           onPageInfo?.(0);
+          // Clear undo history when PDF is unloaded
+          setUndoHistory([]);
           return;
         }
 
@@ -345,28 +358,40 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
       });
     }
 
-    // C) Hover highlight
+    // C) Hover highlight - More prominent
     if (hoveredObjectId) {
       const obj = pageObjects.find((o) => o.id === hoveredObjectId);
       if (obj) {
         const b = obj.bbox;
         ctx.save();
-        ctx.strokeStyle = obj.type === "text" ? "#ffe066" : "#8fd3ff";
+        // Semi-transparent fill for hover
+        ctx.fillStyle = obj.type === "text" ? "rgba(255, 224, 102, 0.2)" : "rgba(143, 211, 255, 0.2)";
+        ctx.fillRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
+        // Thicker, more visible border
+        ctx.strokeStyle = obj.type === "text" ? "#ffb800" : "#1e90ff";
         ctx.lineWidth = 3;
-        ctx.setLineDash([6, 4]);
+        ctx.setLineDash([]);
         ctx.strokeRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
         ctx.restore();
       }
     }
 
-    // D) Selected highlight
+    // D) Selected highlight - Very prominent with thick borders and overlay
     if (selectedObject) {
-      const b = selectedObject. bbox;
+      const b = selectedObject.bbox;
       ctx.save();
-      ctx.strokeStyle = selectedObject.type === "text" ?  "#ff4d4d" : "#3498db";
-      ctx.lineWidth = 3;
-      ctx. setLineDash([8, 5]);
-      ctx.strokeRect(b.x * zoom, b. y * zoom, b.width * zoom, b.height * zoom);
+      // Semi-transparent fill overlay for better visibility
+      ctx.fillStyle = selectedObject.type === "text" 
+        ? "rgba(255, 77, 77, 0.15)" 
+        : "rgba(52, 152, 219, 0.15)";
+      ctx.fillRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
+      // Bright, thick border (4-5px)
+      ctx.strokeStyle = selectedObject.type === "text" 
+        ? "#ff1744"  // Bright red/pink for text
+        : "#2196F3"; // Bright blue for images
+      ctx.lineWidth = 5;
+      ctx.setLineDash([]);
+      ctx.strokeRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
       ctx.restore();
     }
 
@@ -517,13 +542,33 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
   }, [currentTool]);
 
   // ---------------------------------------------------------
-  // 6) Backend call (page -> rects)
+  // 6) Backend call (page -> rects) with undo history
   // ---------------------------------------------------------
   const postDeleteMulti = useCallback(
-    async (pagesToRects) => {
+    async (pagesToRects, saveToHistory = true) => {
       if (!pdfBytes || ! onPdfBytesChange) {
         console.warn("[PdfViewer] Missing pdfBytes or onPdfBytesChange");
         return;
+      }
+
+      // Save current PDF state to undo history before making changes
+      if (saveToHistory) {
+        setUndoHistory((prev) => {
+          const newHistory = [...prev];
+          // Create a copy of the current PDF bytes
+          const pdfCopy = new Uint8Array(pdfBytes);
+          newHistory.push({
+            pdfBytes: pdfCopy,
+            timestamp: Date.now(),
+            action: 'delete',
+          });
+          // Limit history size
+          if (newHistory.length > MAX_UNDO_HISTORY) {
+            newHistory.shift();
+          }
+          console.log(`[DIAG][PdfViewer] Saved to undo history. Stack size: ${newHistory.length}`);
+          return newHistory;
+        });
       }
 
       const formData = new FormData();
@@ -696,6 +741,54 @@ const applyEraseAllPages = useCallback(() => {
   console.log('[PdfViewer] applyEraseAllPages called');
 }, []);
 
+// Undo delete - restore previous PDF state
+const undoDelete = useCallback(() => {
+  if (undoHistory.length === 0) {
+    console.warn("[PdfViewer] No undo history available");
+    return;
+  }
+
+  setUndoHistory((prev) => {
+    const newHistory = [...prev];
+    const lastState = newHistory.pop();
+    
+    if (lastState && lastState.pdfBytes && onPdfBytesChange) {
+      console.log(`[DIAG][PdfViewer] Restoring PDF from undo history. Remaining history: ${newHistory.length}`);
+      onPdfBytesChange(lastState.pdfBytes);
+    }
+    
+    return newHistory;
+  });
+  
+  // Clear selection after undo
+  setSelectedObject(null);
+}, [undoHistory, onPdfBytesChange]);
+
+// Delete selected object - exposed for sidebar button
+const deleteSelected = useCallback(async () => {
+  if (!selectedObject) {
+    console.warn("[PdfViewer] No object selected");
+    return;
+  }
+  if (!(currentTool === "REMOVE_TEXT" || currentTool === "REMOVE_IMAGES")) {
+    console.warn("[PdfViewer] Delete only works in REMOVE_TEXT or REMOVE_IMAGES mode");
+    return;
+  }
+
+  try {
+    const b = padRect(selectedObject.bbox, OCR_PAD);
+    const pages = {
+      [String(currentPage)]: [[b.x, b.y, b.width, b.height]],
+    };
+    console.log(`[DIAG][PdfViewer] Deleting selected ${selectedObject.type} on page ${currentPage}`);
+    await postDeleteMulti(pages, true); // Save to history
+    setSelectedObject(null);
+  } catch (err) {
+    console.error("[PdfViewer] Delete failed:", err);
+    alert("Delete failed: " + (err?.message || String(err)));
+  }
+}, [selectedObject, currentTool, currentPage, postDeleteMulti]);
+
 useImperativeHandle(
   ref,
   () => ({
@@ -709,6 +802,14 @@ useImperativeHandle(
     // Undo ERASE rectangle (Esc)
     undo: undoErase,
 
+    // Undo delete (restore from history)
+    undoDelete,
+    canUndo: undoHistory.length > 0,
+    undoCount: undoHistory.length,
+
+    // Delete selected object
+    deleteSelected,
+
     // ERASE actions
     applyEraseCurrentPage,
     applyEraseAllPages,
@@ -720,6 +821,9 @@ useImperativeHandle(
     currentPage,
     pageCount,
     undoErase,
+    undoDelete,
+    undoHistory.length,
+    deleteSelected,
     applyEraseCurrentPage,
     applyEraseAllPages,
     clearEraseCurrentPage,
@@ -770,21 +874,28 @@ useImperativeHandle(
           <div
             style={{
               position: "absolute",
-              top: 10,
-              left: 10,
-              background: currentTool === "REMOVE_TEXT" ? "#fffbe6" : "#e6f7ff",
-              color: "#333",
-              padding: "8px 16px",
-              borderRadius: 6,
-              boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+              top: 15,
+              left: 15,
+              background: selectedObject 
+                ? (selectedObject.type === "text" ? "#fff3f3" : "#e3f2fd")
+                : (currentTool === "REMOVE_TEXT" ? "#fffbe6" : "#e6f7ff"),
+              color: "#1a1a1a",
+              padding: "12px 20px",
+              borderRadius: 8,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+              border: selectedObject 
+                ? `2px solid ${selectedObject.type === "text" ? "#ff1744" : "#2196F3"}`
+                : "2px solid transparent",
               fontWeight: 600,
-              fontSize: 14,
+              fontSize: 15,
               pointerEvents: "none",
+              maxWidth: 400,
+              lineHeight: 1.4,
             }}
           >
             {selectedObject
-              ? `Selected ${selectedObject.type}.  Press Delete to remove.`
-              : `Click a ${currentTool === "REMOVE_TEXT" ? "text" : "image"} block to select, then press Delete. `}
+              ? `✓ ${selectedObject.type === "text" ? "Text" : "Image"} selected! Press DELETE key or use the "Delete Selected" button in the sidebar →`
+              : `Click a ${currentTool === "REMOVE_TEXT" ? "text" : "image"} block to select it. Then delete using DELETE key or the sidebar button.`}
           </div>
         )}
       </div>

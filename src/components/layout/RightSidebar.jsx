@@ -13,10 +13,18 @@ function RightSidebar({
   currentPage,
   pageCount,
   exportProgress,
+  selectedObject,
+  onDeleteSelected,
+  onUndoDelete,
+  pdfViewerRef,
 }) {
   console.log('[DIAG][RightSidebar] Save/Download button enabled:', canUseEraseActions, 'hasDocument:', hasDocument, 'isExporting:', isExporting);
   
   const isNative = !!window.pdfEditorNative?. isNative;
+
+  // Get undo state from PdfViewer
+  const canUndo = pdfViewerRef?.current?.canUndo || false;
+  const undoCount = pdfViewerRef?.current?.undoCount || 0;
 
   // Helper to get tool-specific descriptions
   const getToolDescription = () => {
@@ -31,13 +39,13 @@ function RightSidebar({
         return {
           title: "Remove Text (T)",
           desc:
-            "Click a text block to select it, then press Delete to permanently remove it via backend redaction.",
+            "Click a text block to select it. Use the Delete button below or press the DELETE key to remove it.",
         };
       case "REMOVE_IMAGES":
         return {
           title: "Remove Images (I)",
           desc:
-            "Click an image block to select it, then press Delete to permanently remove it via backend redaction.",
+            "Click an image block to select it. Use the Delete button below or press the DELETE key to remove it.",
         };
       case "HAND": 
         return {
@@ -55,6 +63,7 @@ function RightSidebar({
 
   const toolInfo = getToolDescription();
   const showEraseCard = currentTool === "ERASE";
+  const showDeleteCard = (currentTool === "REMOVE_TEXT" || currentTool === "REMOVE_IMAGES") && hasDocument;
 
   return (
     <div style={styles.sidebar}>
@@ -67,6 +76,53 @@ function RightSidebar({
           </p>
           <p style={styles.toolDesc}>{toolInfo.desc}</p>
         </div>
+
+        {/* DELETE & UNDO actions (only when REMOVE_TEXT or REMOVE_IMAGES tool is active) */}
+        {showDeleteCard && (
+          <div style={styles.card}>
+            <p style={styles.cardHeader}>Selection Actions</p>
+
+            <button
+              disabled={!selectedObject || isExporting}
+              style={{
+                ...styles.deleteButton,
+                opacity: selectedObject && !isExporting ? 1 : 0.6,
+                cursor: selectedObject && !isExporting ? "pointer" : "not-allowed",
+              }}
+              onClick={() => onDeleteSelected?.()}
+              title={
+                selectedObject
+                  ? `Delete the selected ${selectedObject.type}`
+                  : "Select a text or image block first"
+              }
+            >
+              {selectedObject
+                ? `🗑️ Delete Selected ${selectedObject.type === "text" ? "Text" : "Image"}`
+                : "🗑️ Delete Selected"}
+            </button>
+
+            <button
+              disabled={!canUndo || isExporting}
+              style={{
+                ...styles.undoButton,
+                opacity: canUndo && !isExporting ? 1 : 0.6,
+                cursor: canUndo && !isExporting ? "pointer" : "not-allowed",
+              }}
+              onClick={() => onUndoDelete?.()}
+              title={
+                canUndo
+                  ? `Undo last deletion (${undoCount} action${undoCount !== 1 ? "s" : ""} available)`
+                  : "No deletions to undo"
+              }
+            >
+              ↩️ Undo Delete {canUndo ? `(${undoCount})` : ""}
+            </button>
+
+            <p style={styles.note}>
+              Tip: You can also use the DELETE key to remove selected items.
+            </p>
+          </div>
+        )}
 
         {/* ERASE actions (only when ERASE tool is active) */}
         {showEraseCard && (
@@ -322,6 +378,31 @@ const styles = {
     fontSize: 12,
     fontWeight: 800,
     color: "#b42318",
+    marginBottom: 8,
+    transition: "all 0.15s ease",
+  },
+  deleteButton: {
+    width: "100%",
+    padding: "12px 14px",
+    borderRadius: 8,
+    border: "2px solid #ff1744",
+    background: "#ff1744",
+    fontSize: 13,
+    fontWeight: 700,
+    color: "#ffffff",
+    marginBottom: 10,
+    transition: "all 0.2s ease",
+    boxShadow: "0 2px 6px rgba(255, 23, 68, 0.3)",
+  },
+  undoButton: {
+    width: "100%",
+    padding: "10px 12px",
+    borderRadius: 8,
+    border: "1px solid #1a73e8",
+    background: "#f0f7ff",
+    fontSize: 12,
+    fontWeight: 600,
+    color: "#1a73e8",
     marginBottom: 8,
     transition: "all 0.15s ease",
   },
