@@ -59,6 +59,9 @@ export default function App() {
 
   const [blocks, setBlocks] = useState([]);
 
+  // Selection state for text/image removal
+  const [selectedObject, setSelectedObject] = useState(null);
+
   const nativeApi = window.pdfEditorNative;
   const isNative = !!nativeApi?. isNative;
 const hasDocument = pdfBytes instanceof Uint8Array && pdfBytes.byteLength > 0;
@@ -284,9 +287,19 @@ const uploadAndExtract = useCallback(async (file) => {
   const resetZoom = () => setZoom(1);
 
   /* ---------------------------------------------------------
-     ERASE / UNDO / CLOSE
+     ERASE / UNDO / CLOSE / DELETE
   --------------------------------------------------------- */
   const handleUndo = () => pdfViewerRef.current?. undo?.();
+
+  // Delete selected text/image
+  const handleDeleteSelected = useCallback(() => {
+    pdfViewerRef.current?.deleteSelected?.();
+  }, []);
+
+  // Undo delete operation
+  const handleUndoDelete = useCallback(() => {
+    pdfViewerRef.current?.undoDelete?.();
+  }, []);
 
   const handleApplyEraseCurrentPage = () =>
     pdfViewerRef. current?.applyEraseCurrentPage?.();
@@ -304,6 +317,7 @@ const uploadAndExtract = useCallback(async (file) => {
     setCurrentPage(1);
     setPageCount(0);
     setBlocks([]);
+    setSelectedObject(null);
     setCurrentTool("ERASE");
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
@@ -405,6 +419,7 @@ const uploadAndExtract = useCallback(async (file) => {
           pageCount={pageCount}
           blocks={blocks}
           showDebugOverlay={showDebugOverlay}
+          onSelectedObjectChange={setSelectedObject}
         />
 
         <RightSidebar
@@ -420,6 +435,10 @@ const uploadAndExtract = useCallback(async (file) => {
           onApplyEraseAllPages={handleApplyEraseAllPages}
           onClearEraseCurrentPage={handleClearEraseCurrentPage}
           onClearEraseAllPages={handleClearEraseAllPages}
+          selectedObject={selectedObject}
+          onDeleteSelected={handleDeleteSelected}
+          onUndoDelete={handleUndoDelete}
+          pdfViewerRef={pdfViewerRef}
         />
       </div>
     </div>

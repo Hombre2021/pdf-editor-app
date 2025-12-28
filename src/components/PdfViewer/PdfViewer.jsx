@@ -51,11 +51,19 @@ const PdfViewer = forwardRef(function PdfViewer(
     currentTool = "REMOVE_TEXT",
     currentPage = 1,
     showDebugOverlay = false,
+    onSelectedObjectChange, // ✅ NEW: Callback to notify App about selection changes
   },
   ref
 ) {
   const [pdfDoc, setPdfDoc] = useState(null);
   const [pageCount, setPageCount] = useState(0);
+
+  // Undo history for deletions - stores PDF bytes before each deletion
+  // NOTE: Each entry stores a complete PDF copy (Uint8Array) which can use significant memory for large PDFs.
+  // Limited to 20 actions to prevent excessive memory usage (trade-off between functionality and memory).
+  // For production use with very large PDFs, consider implementing differential storage or CompressedBlob.
+  const [undoHistory, setUndoHistory] = useState([]);
+  const MAX_UNDO_HISTORY = 20;
 
   // Stored in PDF units (scale=1), per page: 
   // { [pageNum]: [{x,y,width,height}, ...] }
@@ -81,6 +89,11 @@ const PdfViewer = forwardRef(function PdfViewer(
 
   const dpr = useMemo(() => window.devicePixelRatio || 1, []);
 
+  // Notify parent when selected object changes
+  useEffect(() => {
+    onSelectedObjectChange?.(selectedObject);
+  }, [selectedObject, onSelectedObjectChange]);
+
   // ---------------------------------------------------------
   // 1) LOAD PDF
   // ---------------------------------------------------------
@@ -93,6 +106,8 @@ const PdfViewer = forwardRef(function PdfViewer(
           setPdfDoc(null);
           setPageCount(0);
           onPageInfo?.(0);
+          // Clear undo history when PDF is unloaded
+          setUndoHistory([]);
           return;
         }
 
@@ -223,21 +238,32 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
       renderTaskRef.current = null;
 
       // Extract objects at scale=1 (PDF units)
-      // Important: We keep everything in the same coordinate orientation
-      // as the canvas:  origin top-left, y down (matches PyMuPDF page coords).
+      // We need to use a scale=1 viewport for coordinate extraction to get true PDF coordinates
+      const viewport1 = page.getViewport({ scale: 1 });
       const textContent = await page.getTextContent();
 
       const textObjs = (textContent.items || [])
         .map((item, idx) => {
-          // Approx bbox in "canvas-like" coordinates: 
-          // x = e, yTop = f - height
-          const x = item.transform?.[4];
-          const yTop = (item.transform?.[5] ??  0) - (item.height ?? 0);
-          const w = item.width ?? 0;
-          const h = item. height ?? 0;
-
-          const bbox = clampRect({ x, y: yTop, width: w, height: h });
-          if (! bbox) return null;
+          // Transform text coordinates using scale=1 viewport
+          // This converts from PDF coordinate space to canvas coordinate space (top-left origin)
+          const transform = item.transform;
+          if (!transform || transform.length < 6) return null;
+          
+          // Apply viewport transformation to get canvas coordinates at scale=1
+          const [x1, y1, x2, y2] = viewport1.convertToViewportRectangle([
+            transform[4], // x
+            transform[5] - item.height, // y (bottom)
+            transform[4] + item.width, // x + width
+            transform[5] // y + height (top in PDF coords)
+          ]);
+          
+          const bbox = clampRect({ 
+            x: Math.min(x1, x2), 
+            y: Math.min(y1, y2), 
+            width: Math.abs(x2 - x1), 
+            height: Math.abs(y2 - y1) 
+          });
+          if (!bbox) return null;
 
           return {
             type: "text",
@@ -258,16 +284,23 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
         ) {
           const args = opList.argsArray[j];
           const matrix = args?.[1];
-          if (! matrix || matrix.length < 6) continue;
+          if (!matrix || matrix.length < 6) continue;
 
-          // Matrix is [a,b,c,d,e,f].  Approx width/height from |a|, |d|. 
-          // Use top-left-ish y = f - h (canvas coords).
-          const w = Math.abs(matrix[0]);
-          const h = Math.abs(matrix[3]);
-          const x = matrix[4];
-          const yTop = matrix[5] - h;
+          // Transform image coordinates using scale=1 viewport
+          // Matrix is [a, b, c, d, e, f] where e,f is position and a,d are scale
+          const [x1, y1, x2, y2] = viewport1.convertToViewportRectangle([
+            matrix[4], // x (left)
+            matrix[5], // y (bottom in PDF coords)
+            matrix[4] + Math.abs(matrix[0]), // x + width
+            matrix[5] + Math.abs(matrix[3])  // y + height
+          ]);
 
-          const bbox = clampRect({ x, y: yTop, width: w, height: h });
+          const bbox = clampRect({ 
+            x: Math.min(x1, x2), 
+            y: Math.min(y1, y2), 
+            width: Math.abs(x2 - x1), 
+            height: Math.abs(y2 - y1) 
+          });
           if (!bbox) continue;
 
           imageObjs.push({
@@ -345,28 +378,40 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
       });
     }
 
-    // C) Hover highlight
+    // C) Hover highlight - More prominent
     if (hoveredObjectId) {
       const obj = pageObjects.find((o) => o.id === hoveredObjectId);
       if (obj) {
         const b = obj.bbox;
         ctx.save();
-        ctx.strokeStyle = obj.type === "text" ? "#ffe066" : "#8fd3ff";
+        // Semi-transparent fill for hover
+        ctx.fillStyle = obj.type === "text" ? "rgba(255, 224, 102, 0.2)" : "rgba(143, 211, 255, 0.2)";
+        ctx.fillRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
+        // Thicker, more visible border
+        ctx.strokeStyle = obj.type === "text" ? "#ffb800" : "#1e90ff";
         ctx.lineWidth = 3;
-        ctx.setLineDash([6, 4]);
+        ctx.setLineDash([]);
         ctx.strokeRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
         ctx.restore();
       }
     }
 
-    // D) Selected highlight
+    // D) Selected highlight - Very prominent with thick borders and overlay
     if (selectedObject) {
-      const b = selectedObject. bbox;
+      const b = selectedObject.bbox;
       ctx.save();
-      ctx.strokeStyle = selectedObject.type === "text" ?  "#ff4d4d" : "#3498db";
-      ctx.lineWidth = 3;
-      ctx. setLineDash([8, 5]);
-      ctx.strokeRect(b.x * zoom, b. y * zoom, b.width * zoom, b.height * zoom);
+      // Semi-transparent fill overlay for better visibility
+      ctx.fillStyle = selectedObject.type === "text" 
+        ? "rgba(255, 77, 77, 0.15)" 
+        : "rgba(52, 152, 219, 0.15)";
+      ctx.fillRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
+      // Bright, thick border (4-5px)
+      ctx.strokeStyle = selectedObject.type === "text" 
+        ? "#ff1744"  // Bright red/pink for text
+        : "#2196F3"; // Bright blue for images
+      ctx.lineWidth = 5;
+      ctx.setLineDash([]);
+      ctx.strokeRect(b.x * zoom, b.y * zoom, b.width * zoom, b.height * zoom);
       ctx.restore();
     }
 
@@ -517,13 +562,33 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
   }, [currentTool]);
 
   // ---------------------------------------------------------
-  // 6) Backend call (page -> rects)
+  // 6) Backend call (page -> rects) with undo history
   // ---------------------------------------------------------
   const postDeleteMulti = useCallback(
-    async (pagesToRects) => {
+    async (pagesToRects, saveToHistory = true) => {
       if (!pdfBytes || ! onPdfBytesChange) {
         console.warn("[PdfViewer] Missing pdfBytes or onPdfBytesChange");
         return;
+      }
+
+      // Save current PDF state to undo history before making changes
+      if (saveToHistory) {
+        setUndoHistory((prev) => {
+          const newHistory = [...prev];
+          // Create a copy of the current PDF bytes
+          const pdfCopy = new Uint8Array(pdfBytes);
+          newHistory.push({
+            pdfBytes: pdfCopy,
+            timestamp: Date.now(),
+            action: 'delete',
+          });
+          // Limit history size
+          if (newHistory.length > MAX_UNDO_HISTORY) {
+            newHistory.shift();
+          }
+          console.log(`[DIAG][PdfViewer] Saved to undo history. Stack size: ${newHistory.length}`);
+          return newHistory;
+        });
       }
 
       const formData = new FormData();
@@ -696,6 +761,54 @@ const applyEraseAllPages = useCallback(() => {
   console.log('[PdfViewer] applyEraseAllPages called');
 }, []);
 
+// Undo delete - restore previous PDF state
+const undoDelete = useCallback(() => {
+  setUndoHistory((prev) => {
+    if (prev.length === 0) {
+      console.warn("[PdfViewer] No undo history available");
+      return prev;
+    }
+
+    const newHistory = [...prev];
+    const lastState = newHistory.pop();
+    
+    if (lastState && lastState.pdfBytes && onPdfBytesChange) {
+      console.log(`[DIAG][PdfViewer] Restoring PDF from undo history. Remaining history: ${newHistory.length}`);
+      onPdfBytesChange(lastState.pdfBytes);
+    }
+    
+    return newHistory;
+  });
+  
+  // Clear selection after undo
+  setSelectedObject(null);
+}, [onPdfBytesChange]);
+
+// Delete selected object - exposed for sidebar button
+const deleteSelected = useCallback(async () => {
+  if (!selectedObject) {
+    console.warn("[PdfViewer] No object selected");
+    return;
+  }
+  if (!(currentTool === "REMOVE_TEXT" || currentTool === "REMOVE_IMAGES")) {
+    console.warn("[PdfViewer] Delete only works in REMOVE_TEXT or REMOVE_IMAGES mode");
+    return;
+  }
+
+  try {
+    const b = padRect(selectedObject.bbox, OCR_PAD);
+    const pages = {
+      [String(currentPage)]: [[b.x, b.y, b.width, b.height]],
+    };
+    console.log(`[DIAG][PdfViewer] Deleting selected ${selectedObject.type} on page ${currentPage}`);
+    await postDeleteMulti(pages, true); // Save to history
+    setSelectedObject(null);
+  } catch (err) {
+    console.error("[PdfViewer] Delete failed:", err);
+    alert("Delete failed: " + (err?.message || String(err)));
+  }
+}, [selectedObject, currentTool, currentPage, postDeleteMulti]);
+
 useImperativeHandle(
   ref,
   () => ({
@@ -709,6 +822,14 @@ useImperativeHandle(
     // Undo ERASE rectangle (Esc)
     undo: undoErase,
 
+    // Undo delete (restore from history)
+    undoDelete,
+    canUndo: undoHistory.length > 0,
+    undoCount: undoHistory.length,
+
+    // Delete selected object
+    deleteSelected,
+
     // ERASE actions
     applyEraseCurrentPage,
     applyEraseAllPages,
@@ -720,6 +841,9 @@ useImperativeHandle(
     currentPage,
     pageCount,
     undoErase,
+    undoDelete,
+    undoHistory.length,
+    deleteSelected,
     applyEraseCurrentPage,
     applyEraseAllPages,
     clearEraseCurrentPage,
@@ -770,21 +894,28 @@ useImperativeHandle(
           <div
             style={{
               position: "absolute",
-              top: 10,
-              left: 10,
-              background: currentTool === "REMOVE_TEXT" ? "#fffbe6" : "#e6f7ff",
-              color: "#333",
-              padding: "8px 16px",
-              borderRadius: 6,
-              boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+              top: 15,
+              left: 15,
+              background: selectedObject 
+                ? (selectedObject.type === "text" ? "#fff3f3" : "#e3f2fd")
+                : (currentTool === "REMOVE_TEXT" ? "#fffbe6" : "#e6f7ff"),
+              color: "#1a1a1a",
+              padding: "12px 20px",
+              borderRadius: 8,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+              border: selectedObject 
+                ? `2px solid ${selectedObject.type === "text" ? "#ff1744" : "#2196F3"}`
+                : "2px solid transparent",
               fontWeight: 600,
-              fontSize: 14,
+              fontSize: 15,
               pointerEvents: "none",
+              maxWidth: 400,
+              lineHeight: 1.4,
             }}
           >
             {selectedObject
-              ? `Selected ${selectedObject.type}.  Press Delete to remove.`
-              : `Click a ${currentTool === "REMOVE_TEXT" ? "text" : "image"} block to select, then press Delete. `}
+              ? `✓ ${selectedObject.type === "text" ? "Text" : "Image"} selected! Press DELETE key or use the "Delete Selected" button in the sidebar →`
+              : `Click a ${currentTool === "REMOVE_TEXT" ? "text" : "image"} block to select it. Then delete using DELETE key or the sidebar button.`}
           </div>
         )}
       </div>
