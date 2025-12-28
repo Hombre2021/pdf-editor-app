@@ -59,7 +59,9 @@ const PdfViewer = forwardRef(function PdfViewer(
   const [pageCount, setPageCount] = useState(0);
 
   // Undo history for deletions - stores PDF bytes before each deletion
-  // Limited to 20 actions to prevent excessive memory usage
+  // NOTE: Each entry stores a complete PDF copy (Uint8Array) which can use significant memory for large PDFs.
+  // Limited to 20 actions to prevent excessive memory usage (trade-off between functionality and memory).
+  // For production use with very large PDFs, consider implementing differential storage or CompressedBlob.
   const [undoHistory, setUndoHistory] = useState([]);
   const MAX_UNDO_HISTORY = 20;
 
@@ -743,12 +745,12 @@ const applyEraseAllPages = useCallback(() => {
 
 // Undo delete - restore previous PDF state
 const undoDelete = useCallback(() => {
-  if (undoHistory.length === 0) {
-    console.warn("[PdfViewer] No undo history available");
-    return;
-  }
-
   setUndoHistory((prev) => {
+    if (prev.length === 0) {
+      console.warn("[PdfViewer] No undo history available");
+      return prev;
+    }
+
     const newHistory = [...prev];
     const lastState = newHistory.pop();
     
@@ -762,7 +764,7 @@ const undoDelete = useCallback(() => {
   
   // Clear selection after undo
   setSelectedObject(null);
-}, [undoHistory, onPdfBytesChange]);
+}, [onPdfBytesChange]);
 
 // Delete selected object - exposed for sidebar button
 const deleteSelected = useCallback(async () => {
