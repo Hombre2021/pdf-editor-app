@@ -238,21 +238,32 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
       renderTaskRef.current = null;
 
       // Extract objects at scale=1 (PDF units)
-      // Important: We keep everything in the same coordinate orientation
-      // as the canvas:  origin top-left, y down (matches PyMuPDF page coords).
+      // We need to use a scale=1 viewport for coordinate extraction to get true PDF coordinates
+      const viewport1 = page.getViewport({ scale: 1 });
       const textContent = await page.getTextContent();
 
       const textObjs = (textContent.items || [])
         .map((item, idx) => {
-          // Approx bbox in "canvas-like" coordinates: 
-          // x = e, yTop = f - height
-          const x = item.transform?.[4];
-          const yTop = (item.transform?.[5] ??  0) - (item.height ?? 0);
-          const w = item.width ?? 0;
-          const h = item. height ?? 0;
-
-          const bbox = clampRect({ x, y: yTop, width: w, height: h });
-          if (! bbox) return null;
+          // Transform text coordinates using scale=1 viewport
+          // This converts from PDF coordinate space to canvas coordinate space (top-left origin)
+          const transform = item.transform;
+          if (!transform || transform.length < 6) return null;
+          
+          // Apply viewport transformation to get canvas coordinates at scale=1
+          const [x1, y1, x2, y2] = viewport1.convertToViewportRectangle([
+            transform[4], // x
+            transform[5] - item.height, // y (bottom)
+            transform[4] + item.width, // x + width
+            transform[5] // y + height (top in PDF coords)
+          ]);
+          
+          const bbox = clampRect({ 
+            x: Math.min(x1, x2), 
+            y: Math.min(y1, y2), 
+            width: Math.abs(x2 - x1), 
+            height: Math.abs(y2 - y1) 
+          });
+          if (!bbox) return null;
 
           return {
             type: "text",
@@ -273,16 +284,23 @@ console.log("[DIAG][PdfViewer] Created dataCopy, byteLength:", dataCopy. byteLen
         ) {
           const args = opList.argsArray[j];
           const matrix = args?.[1];
-          if (! matrix || matrix.length < 6) continue;
+          if (!matrix || matrix.length < 6) continue;
 
-          // Matrix is [a,b,c,d,e,f].  Approx width/height from |a|, |d|. 
-          // Use top-left-ish y = f - h (canvas coords).
-          const w = Math.abs(matrix[0]);
-          const h = Math.abs(matrix[3]);
-          const x = matrix[4];
-          const yTop = matrix[5] - h;
+          // Transform image coordinates using scale=1 viewport
+          // Matrix is [a, b, c, d, e, f] where e,f is position and a,d are scale
+          const [x1, y1, x2, y2] = viewport1.convertToViewportRectangle([
+            matrix[4], // x (left)
+            matrix[5], // y (bottom in PDF coords)
+            matrix[4] + Math.abs(matrix[0]), // x + width
+            matrix[5] + Math.abs(matrix[3])  // y + height
+          ]);
 
-          const bbox = clampRect({ x, y: yTop, width: w, height: h });
+          const bbox = clampRect({ 
+            x: Math.min(x1, x2), 
+            y: Math.min(y1, y2), 
+            width: Math.abs(x2 - x1), 
+            height: Math.abs(y2 - y1) 
+          });
           if (!bbox) continue;
 
           imageObjs.push({
